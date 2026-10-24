@@ -1,0 +1,4 @@
+f2==0.0.1.7
+six==1.17.0
+playwright>=1.48,<2
+prompt-toolkit>=3.0.48,<4

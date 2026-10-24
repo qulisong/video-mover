@@ -1,0 +1,9 @@
+-r requirements-portrait.txt
+torch>=2.6,<3
+torchvision>=0.21,<1
+diffusers>=0.35,<0.37
+transformers>=4.44,<5
+accelerate>=1,<2
+safetensors>=0.4.5,<1
+huggingface-hub>=0.34,<1
+Pillow>=10.4,<13

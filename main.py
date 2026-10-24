@@ -1,440 +1,230 @@
-import os
-import sys
-import time
-import signal
-import psutil
+import argparse
+import importlib.util
+import json
 import logging
-import subprocess
-from abc import ABC, abstractmethod
+import os
 from pathlib import Path
-from typing import Optional, List, Dict
-from zoneinfo import ZoneInfo
-from functools import lru_cache
-from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor
-from apscheduler.schedulers.blocking import BlockingScheduler
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
-from logging.handlers import RotatingFileHandler
+import re
+import subprocess
+import sys
+from urllib.parse import parse_qs, urlsplit
 
-if os.name == 'nt':
-    import win32api
 
-# 模块级导出定义
-__all__ = ['AppConfig', 'HandlerBase', 'TaskPlugin', 'FileManager', 'FlushHandler', 
-           'MainCommandHandler', 'UploadHandler', 'SchedulerManager']
+BASE_DIR = Path(__file__).resolve().parent
+logger = logging.getLogger(__name__)
 
-# 配置日志（同时输出到终端和文件）
-handler = RotatingFileHandler(
-    'app.log',
-    maxBytes=10*1024*1024,
-    backupCount=5,
-    encoding='utf-8'  # 文件使用 UTF-8 编码
-)
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setFormatter(logging.Formatter(
-    '%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-))  # 终端输出格式与文件一致
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    handlers=[handler, console_handler]
-)
+def video_id(url: str) -> str | None:
+    parsed = urlsplit(url)
+    if parsed.hostname not in ("www.douyin.com", "douyin.com"):
+        return None
+    parts = parsed.path.strip("/").split("/")
+    if len(parts) == 2 and parts[0] in ("video", "note") and parts[1].isdigit():
+        return parts[1]
+    modal_id = parse_qs(parsed.query).get("modal_id", [""])[0]
+    return modal_id if modal_id.isdigit() else None
 
-# 配置类
-class AppConfig:
-    """应用程序配置类，负责加载和解析配置文件，并验证路径有效性。
 
-    Attributes:
-        DOWNLOAD_DIR (Path): 下载目录路径。
-        DEDUP_DIR (Path): 去重目录路径。
-        UPLOAD_DIR (Path): 上传目录路径。
-        FLUSH_SCRIPT (Path): 刷新脚本路径。
-        DEDUP_SCRIPT (Path): 去重脚本路径。
-        UPLOAD_SCRIPT (Path): 上传脚本路径。
-        MAIN_COMMAND (list): 主抓取命令。
-        SCHEDULE_INTERVAL (int): 调度间隔（分钟，取值范围：1-1440）。
-        TIMEZONE (str): 时区，默认 Asia/Singapore。
-        MAX_WORKERS (int): 最大工作线程数，默认 CPU 核心数。
-    """
-    def __init__(self):
-        base_dir = Path(__file__).parent.resolve()
+def existing_video(directory: Path, target_id: str | None) -> Path | None:
+    if target_id:
+        for path in directory.rglob(f"{target_id}_video.mp4"):
+            if path.is_file() and path.stat().st_size > 0:
+                return path
+    return None
 
-        self.DOWNLOAD_DIR = (base_dir / 'Download/tiktok/post/astrospaceq').resolve()
-        self.DEDUP_DIR = (base_dir / 'Dedup').resolve()
-        self.UPLOAD_DIR = (base_dir / 'Upload').resolve()
-        self.FLUSH_SCRIPT = (base_dir / 'flush_device_id.py').resolve()
-        self.DEDUP_SCRIPT = (base_dir / 'Dedup/dedup.py').resolve()
-        self.UPLOAD_SCRIPT = (base_dir / 'Upload/vx_upload.py').resolve()
-        self.MAIN_COMMAND = ['f2', 'tk', '-c', 'my_apps.yaml', '-u', 'https://www.tiktok.com/@astrospaceq']
-        self.SCHEDULE_INTERVAL = 300
-        self.TIMEZONE = 'Asia/Singapore'
-        self.MAX_WORKERS = os.cpu_count()
 
-        for path, name in [
-            (self.DOWNLOAD_DIR, "下载目录"), (self.DEDUP_DIR, "去重目录"), 
-            (self.UPLOAD_DIR, "上传目录"), (self.FLUSH_SCRIPT, "刷新脚本"), 
-            (self.DEDUP_SCRIPT, "去重脚本"), (self.UPLOAD_SCRIPT, "上传脚本")
-        ]:
-            if not path.exists():
-                raise FileNotFoundError(f"{name}不存在: {path}")
+def prepare_video_directory(root: Path, target_id: str) -> Path:
+    if not isinstance(target_id, str) or not target_id.isascii() or not target_id.isdigit():
+        raise ValueError("视频目录需要有效的数字视频 ID。")
+    directory = root / target_id
+    if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+        raise FileExistsError(f"视频目录路径被其他文件或链接占用: {directory}")
+    legacy_files = sorted(root.glob(f"{target_id}_*"))
+    moves = []
+    for source in legacy_files:
+        if source.is_symlink():
+            raise FileExistsError(f"旧版下载文件是链接，请先手动处理: {source}")
+        if not source.is_file():
+            continue
+        destination = directory / source.name
+        if destination.exists() or destination.is_symlink():
+            raise FileExistsError(f"视频目录中存在同名文件，未迁移或覆盖，请先手动处理: {destination}")
+        moves.append((source, destination))
+    directory.mkdir(parents=True, exist_ok=True)
+    for source, destination in moves:
+        source.rename(destination)
+    if moves:
+        logger.info("已将 %s 个旧版文件整理到视频目录: %s", len(moves), directory)
+    return directory
 
-# 抽象基类
-class HandlerBase(ABC):
-    """Handler基类，提供通用的子进程参数构建方法。"""
-    def _build_subprocess_args(self) -> Dict[str, any]:
-        return {
-            'stdout': subprocess.PIPE,
-            'stderr': subprocess.PIPE,
-            'encoding': 'utf-8',
-            'errors': 'replace',
-            'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
-        }
 
-    @abstractmethod
-    def run(self) -> bool:
-        pass
+def parse_video_url(text: str) -> str:
+    urls = re.findall(r"https?://[^\s<>\"']+", text)
+    for candidate in urls:
+        candidate = candidate.rstrip(".,;!?，。；！？）)]}")
+        url = urlsplit(candidate)
+        if url.username or url.password or url.port not in (None, 443):
+            continue
+        if url.scheme != "https":
+            continue
+        if url.hostname == "v.douyin.com" and re.fullmatch(r"/[A-Za-z0-9_-]+/?", url.path):
+            return candidate
+        if url.hostname in ("www.douyin.com", "douyin.com") and re.fullmatch(
+            r"/(?:video|note)/\d+/?", url.path
+        ):
+            return candidate
+        if url.hostname in ("www.douyin.com", "douyin.com"):
+            modal_id = parse_qs(url.query).get("modal_id", [""])[0]
+            if re.fullmatch(r"\d+", modal_id):
+                return f"https://www.douyin.com/video/{modal_id}"
+    raise ValueError("请输入抖音单条视频或图文链接，或包含 https://v.douyin.com/ 链接的分享文案。")
 
-# 任务插件接口
-class TaskPlugin(ABC):
-    """任务插件抽象基类，用于动态扩展任务类型。"""
-    @abstractmethod
-    def execute(self, context: Dict[str, any]) -> bool:
-        pass
 
-# 文件变化监控处理器
-class FileChangeHandler(FileSystemEventHandler):
-    """监控文件变化的事件处理器。"""
-    def __init__(self, callback):
-        self.callback = callback
+def video_snapshot(directory: Path) -> dict[Path, tuple[int, int]]:
+    result = {}
+    for path in directory.rglob("*.mp4"):
+        stat = path.stat()
+        result[path] = (stat.st_size, stat.st_mtime_ns)
+    return result
 
-    def on_modified(self, event):
-        if not event.is_directory:
-            self.callback(event.src_path)
 
-# 文件管理类
-class FileManager(HandlerBase):
-    """文件管理类，负责生成时间范围和去重视频。"""
-    def __init__(self, config: AppConfig):
-        self.config = config
-        self.observer = Observer()
-        self.observer.schedule(
-            FileChangeHandler(self._on_file_changed), 
-            str(self.config.DOWNLOAD_DIR), 
-            recursive=True
+def download_video(url: str, output: Path, config: Path, browser_login: bool = False) -> int:
+    url = parse_video_url(url)
+    if not config.is_file():
+        raise FileNotFoundError(f"下载配置文件不存在: {config}")
+    if importlib.util.find_spec("f2") is None:
+        raise RuntimeError(
+            f'缺少 F2，请执行: "{sys.executable}" -m pip install -r requirements-download.txt'
         )
-        self.observer.start()
-
-    def _on_file_changed(self, file_path: str) -> None:
-        logging.debug(f"检测到文件变化: {file_path}")
-
-    def generate_time_range(self, interval_minutes: int) -> str:
-        tz = ZoneInfo(self.config.TIMEZONE)
-        now = datetime.now(tz)
-        start_time = now - timedelta(minutes=interval_minutes)
-        return f"{start_time.strftime('%Y-%m-%d %H-%M-%S')}|{now.strftime('%Y-%m-%d %H-%M-%S')}"
-
-    def dedup_videos(self, time_range_str: str) -> int:
+    existing = existing_video(output, video_id(url))
+    output.mkdir(parents=True, exist_ok=True)
+    before = video_snapshot(output)
+    before_archives = {
+        path: path.stat().st_mtime_ns for path in output.rglob("*_archive.json")
+    }
+    command = [
+        sys.executable, "-X", "utf8", str(BASE_DIR / "f2_download.py"),
+        "--config", str(config), "--url", url, "--output", str(output),
+    ]
+    if browser_login:
+        command.append("--browser-login")
+    logger.info("开始下载抖音作品，保存目录: %s", output)
+    process = subprocess.run(
+        command, cwd=BASE_DIR, env={**os.environ, "PYTHONUTF8": "1"}, check=False
+    )
+    if process.returncode != 0:
+        logger.error("F2 下载失败，退出码: %s；请检查上方错误、Cookie 和网络。", process.returncode)
+        return 1
+    if browser_login:
+        logger.info("浏览器作品归档处理完成；附属素材状态及缺失项见归档清单和上方日志。")
+        return 0
+    target_id = video_id(url)
+    manifests = (
+        [output / target_id / f"{target_id}_archive.json"] if target_id else [
+            path for path in output.rglob("*_archive.json")
+            if before_archives.get(path) != path.stat().st_mtime_ns
+        ]
+    )
+    for manifest in manifests:
+        if not manifest.is_file():
+            continue
         try:
-            start_str, end_str = time_range_str.split('|')
-            start_time = datetime.strptime(start_str, "%Y-%m-%d %H-%M-%S")
-            end_time = datetime.strptime(end_str, "%Y-%m-%d %H-%M-%S")
-        except ValueError as e:
-            logging.error(f"时间范围解析失败: {e}")
+            report = json.loads(manifest.read_text(encoding="utf-8"))
+        except (ValueError, UnicodeError):
+            logger.error("下载后的归档清单无法解析: %s", manifest)
+            return 1
+        if not isinstance(report, dict):
+            logger.error("下载后的归档清单格式无效: %s", manifest)
+            return 1
+        if report.get("media_type") == "image_gallery":
+            from video_archive import gallery_files
+
+            images = gallery_files(report, manifest.parent)
+            if not images:
+                logger.error("图文作品没有完整且校验通过的图片，请检查归档清单: %s", manifest)
+                return 1
+            logger.info("已保存图文作品的 %s 张图片，归档清单: %s", len(images), manifest)
             return 0
+    if existing:
+        saved = existing_video(output, video_id(url))
+        if saved is None:
+            logger.error("处理结束后未找到原有视频，请检查视频目录和上方日志。")
+            return 1
+        logger.info("视频已存在，已请求更新作品资料及缺失素材: %s", saved)
+        return 0
+    after = video_snapshot(output)
+    downloaded = [
+        path for path, state in after.items()
+        if state[0] > 0 and before.get(path) != state
+    ]
+    if not downloaded:
+        logger.error(
+            "F2 已退出，但未发现新增或更新的非空 MP4。"
+            "也未找到本次图文作品的完整归档；请检查 Cookie、平台验证和上方日志。"
+        )
+        return 1
+    for path in downloaded:
+        logger.info("已保存视频: %s", path)
+    return 0
 
-        video_files = self._get_video_files(start_time, end_time)
-        with ThreadPoolExecutor(max_workers=self.config.MAX_WORKERS) as executor:
-            futures = [executor.submit(self._process_video, file) for file in video_files]
-            total_processed = sum(f.result() for f in futures if f.result() is not None)
-        logging.info(f"已处理 {total_processed} 个视频")
-        return total_processed
 
-    def _get_video_files(self, start_time: datetime, end_time: datetime) -> List[Path]:
-        video_files = []
-        for folder_path in self.config.DOWNLOAD_DIR.glob('*'):
-            if not folder_path.is_dir():
-                continue
-            folder_time = self._parse_folder_time(folder_path.name)
-            if folder_time and start_time <= folder_time <= end_time:
-                for file in folder_path.glob('*.mp4'):
-                    video_files.append(file)
-        return video_files
-
-    @lru_cache(maxsize=100)
-    def _parse_folder_time(self, folder_name: str) -> Optional[datetime]:
-        try:
-            return datetime.strptime(folder_name, "%Y-%m-%d %H-%M-%S")
-        except ValueError:
-            return None
-
-    def _process_video(self, input_file: Path) -> bool:
-        output_dir = self.config.UPLOAD_DIR / 'videos'
-        output_dir.mkdir(parents=True, exist_ok=True)
-        output_file = output_dir / input_file.name
-        try:
-            process = subprocess.Popen(
-                [sys.executable, str(self.config.DEDUP_SCRIPT), "-i", str(input_file), "-o", str(output_file)],
-                cwd=self.config.DEDUP_DIR,
-                stdout=None,
-                stderr=None,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
+def run_browser_session(output: Path, config: Path, initial_url: str | None = None) -> int:
+    if not config.is_file():
+        raise FileNotFoundError(f"下载配置文件不存在: {config}")
+    for package in ("f2", "playwright", "prompt_toolkit"):
+        if importlib.util.find_spec(package) is None:
+            raise RuntimeError(
+                f'缺少 {package}，请执行: "{sys.executable}" -m pip install -r requirements-download.txt'
             )
-            process.wait()
-            if process.returncode == 0:
-                logging.info(f"已去重并导出: {input_file.name}")
-                return True
-            else:
-                logging.error(f"去重失败: {input_file.name}，返回码: {process.returncode}")
-                return False
-        except Exception as e:
-            logging.error(f"处理视频失败: {input_file.name} -> {e}")
-            return False
+    command = [
+        sys.executable, "-X", "utf8", str(BASE_DIR / "f2_download.py"),
+        "--browser-session", "--config", str(config), "--output", str(output),
+    ]
+    if initial_url is not None:
+        command.extend(["--url", parse_video_url(initial_url)])
+    return subprocess.run(
+        command, cwd=BASE_DIR, env={**os.environ, "PYTHONUTF8": "1"}, check=False
+    ).returncode
 
-    def run(self) -> bool:
-        """实现抽象方法，执行去重任务。"""
-        time_range = self.generate_time_range(self.config.SCHEDULE_INTERVAL)
-        return self.dedup_videos(time_range) > 0
 
-# 刷新处理器
-class FlushHandler(HandlerBase):
-    """刷新处理类，负责执行刷新脚本并检查设备ID更新。"""
-    def __init__(self, config: AppConfig):
-        self.config = config
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="下载抖音单条视频或图文（默认不加工、不上传）。")
+    parser.add_argument("url", nargs="?", help="抖音视频、图文链接或完整分享文案")
+    parser.add_argument("--output", type=Path, help="下载根目录，每个作品保存到其 ID 子目录，默认 Download\\douyin")
+    parser.add_argument("--config", type=Path, help="F2 配置，默认 douyin.example.yaml")
+    parser.add_argument(
+        "--browser-login", action="store_true",
+        help="启动常驻浏览器会话，登录后连续输入视频或图文链接，输入 exit 退出",
+    )
+    parser.add_argument(
+        "--pipeline", action="store_true",
+        help="运行旧版 TikTok 下载、加工和视频号上传流水线（需另外配置）",
+    )
+    args = parser.parse_args(argv)
+    if args.pipeline:
+        if args.url or args.output is not None or args.config is not None or args.browser_login:
+            parser.error("--pipeline 不能与抖音下载参数一起使用")
+        from pipeline import run_pipeline
+        run_pipeline()
+        return 0
+    try:
+        output = (args.output if args.output is not None else BASE_DIR / "Download" / "douyin").resolve()
+        config = (args.config if args.config is not None else BASE_DIR / "douyin.example.yaml").resolve()
+        if args.browser_login:
+            return run_browser_session(output, config, args.url)
+        text = args.url if args.url is not None else input("请输入抖音视频或图文链接或分享文案: ")
+        return download_video(text, output, config)
+    except (ValueError, OSError, RuntimeError) as error:
+        logger.error("%s", error)
+        return 1
+    except EOFError:
+        logger.error("未收到视频链接。也可以运行: python main.py \"抖音视频链接\"")
+        return 1
+    except KeyboardInterrupt:
+        logger.info("已退出下载会话。")
+        return 130
 
-    def run(self) -> bool:
-        logging.info(f"\n{'='*35}\n开始执行刷新脚本 - 时间: {datetime.now(ZoneInfo(self.config.TIMEZONE)).strftime('%Y-%m-%d %H:%M:%S')}")
-        process = subprocess.Popen(
-            [sys.executable, str(self.config.FLUSH_SCRIPT)],
-            stdout=None,
-            stderr=None,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
-        )
-        process.wait()
-        success = process.returncode == 0
-        if success:
-            logging.info("✅ 刷新脚本执行成功")
-        else:
-            logging.error(f"刷新脚本执行失败，返回码: {process.returncode}")
-        logging.info(f"\n{'='*35}\n刷新脚本执行结束 - 时间: {datetime.now(ZoneInfo(self.config.TIMEZONE)).strftime('%Y-%m-%d %H:%M:%S')}")
-        return success
-
-# 主命令处理器
-class MainCommandHandler(HandlerBase):
-    """主命令处理类，负责执行主抓取命令。"""
-    def __init__(self, config: AppConfig):
-        self.config = config
-        self.current_process = None
-
-    def execute_main_command(self, time_range_str: str) -> tuple[bool, bool]:
-        command = self.config.MAIN_COMMAND + ["-i", time_range_str]
-        logging.info(f"\n{'='*35}\n开始执行主命令 - 时间: {datetime.now(ZoneInfo(self.config.TIMEZONE)).strftime('%Y-%m-%d %H:%M:%S')}")
-        self.current_process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,          # 捕获标准输出
-            stderr=subprocess.STDOUT,        # 将标准错误合并到标准输出
-            text=True,                       # 以文本模式读取
-            bufsize=1,                       # 逐行缓冲
-            universal_newlines=True,         # 跨平台换行符处理
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
-        )
-        forbidden_found = False
-        while True:
-            output = self.current_process.stdout.readline()
-            if output == '' and self.current_process.poll() is not None:
-                break
-            if output:
-                print(output, end='')        # 实时输出到终端
-                sys.stdout.flush()           # 确保输出不缓冲
-                if "403 Forbidden" in output:
-                    forbidden_found = True   # 检测到 "403 Forbidden"
-        self.current_process.wait()
-        success = self.current_process.returncode == 0
-        logging.info(f"\n{'='*35}\n主命令执行结束 - 时间: {datetime.now(ZoneInfo(self.config.TIMEZONE)).strftime('%Y-%m-%d %H:%M:%S')}")
-        return success, forbidden_found      # 返回成功状态和是否检测到 "403 Forbidden"
-
-    def run(self) -> bool:
-        """实现抽象方法，执行主命令。"""
-        time_range = self.generate_time_range(self.config.SCHEDULE_INTERVAL)
-        return self.execute_main_command(time_range)
-
-    def generate_time_range(self, interval_minutes: int) -> str:
-        tz = ZoneInfo(self.config.TIMEZONE)
-        now = datetime.now(tz)
-        start_time = now - timedelta(minutes=interval_minutes)
-        return f"{start_time.strftime('%Y-%m-%d %H-%M-%S')}|{now.strftime('%Y-%m-%d %H-%M-%S')}"
-
-# 上传处理器
-class UploadHandler(HandlerBase):
-    """视频上传处理类，负责执行上传脚本。"""
-    def __init__(self, config: AppConfig):
-        self.config = config
-
-    def run(self) -> bool:
-        self.config.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-        logging.info(f"\n{'='*35}\n开始执行上传脚本 - 时间: {datetime.now(ZoneInfo(self.config.TIMEZONE)).strftime('%Y-%m-%d %H:%M:%S')}")
-        process = subprocess.Popen(
-            [sys.executable, str(self.config.UPLOAD_SCRIPT)],
-            stdout=None,
-            stderr=None,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
-        )
-        process.wait()
-        success = process.returncode == 0
-        if success:
-            logging.info("✅ 上传脚本执行成功")
-        else:
-            logging.error(f"上传脚本执行失败，返回码: {process.returncode}")
-        logging.info(f"\n{'='*35}\n上传脚本执行结束 - 时间: {datetime.now(ZoneInfo(self.config.TIMEZONE)).strftime('%Y-%m-%d %H:%M:%S')}")
-        return success
-
-# 调度管理类
-class SchedulerManager:
-    """调度管理类，负责调度任务的执行和信号处理。"""
-    PROCESS_TERMINATE_TIMEOUT = 5
-
-    def __init__(self, config: AppConfig, file_manager: FileManager, flush_handler: FlushHandler, 
-                 main_handler: MainCommandHandler, upload_handler: UploadHandler):
-        self.config = config
-        self.file_manager = file_manager
-        self.flush_handler = flush_handler
-        self.main_handler = main_handler
-        self.upload_handler = upload_handler
-        self.scheduler = BlockingScheduler(timezone=self.config.TIMEZONE)
-        self.shutdown_flag = False
-        self.plugins = [DedupPlugin(file_manager)]
-
-    def start(self) -> None:
-        self._print_banner()
-        self._setup_jobs()
-        self._register_signals()
-        logging.info("调度器启动中...")
-        try:
-            self.scheduler.start()
-        except (KeyboardInterrupt, SystemExit):
-            logging.info("接收到中断信号，正在关闭...")
-            self.shutdown()
-        except Exception as e:
-            logging.error(f"调度器异常: {e}", exc_info=True)
-            self.shutdown()
-
-    def _print_banner(self) -> None:
-        logging.info(
-            f"\n{'=' * 35}\n"
-            "TikTok数据抓取调度器\n"
-            f"动态时间范围: 滚动{self.config.SCHEDULE_INTERVAL}分钟窗口\n"
-            f"执行间隔: 每{self.config.SCHEDULE_INTERVAL}分钟\n"
-            "退出方式: Ctrl+C\n"
-            f"{'=' * 35}"
-        )
-
-    def _setup_jobs(self) -> None:
-        self.scheduler.add_job(
-            self._job_wrapper,
-            'interval',
-            minutes=self.config.SCHEDULE_INTERVAL,
-            next_run_time=datetime.now(ZoneInfo(self.config.TIMEZONE)),
-            misfire_grace_time=600,
-            max_instances=2
-        )
-
-    def _job_wrapper(self) -> None:
-        start_time = time.time()
-        start_cpu = psutil.cpu_percent()
-        start_mem = psutil.virtual_memory().used
-        logging.info(f"开始执行任务 - 时间: {datetime.now(ZoneInfo(self.config.TIMEZONE))}")
-        try:
-            if self.shutdown_flag:
-                logging.info("调度器已标记为关闭，跳过任务执行")
-                return
-            time_range = self.file_manager.generate_time_range(self.config.SCHEDULE_INTERVAL)
-            context = {'time_range': time_range}
-            success, forbidden_found = self.main_handler.execute_main_command(time_range)
-            if forbidden_found:  # 仅在失败且检测到 "403 Forbidden" 时执行
-                logging.info("检测到 '403 Forbidden'，执行 flush_handler")
-                if self.flush_handler.run():
-                    logging.info("flush_handler 执行成功，准备重试 execute_main_command")
-                    success, forbidden_found = self.main_handler.execute_main_command(time_range)
-                else:
-                    logging.warning("flush_handler 执行失败，跳过重试")
-            if success:  # 仅当最终成功时执行后续任务
-                for plugin in self.plugins:
-                    plugin.execute(context)
-                self.upload_handler.run()
-            else:
-                logging.warning("主命令执行失败，跳过后续任务")
-        except Exception as e:
-            logging.error(f"任务执行失败: {e}", exc_info=True)
-        finally:
-            end_time = time.time()
-            end_cpu = psutil.cpu_percent()
-            end_mem = psutil.virtual_memory().used
-            logging.info(f"任务执行耗时: {end_time - start_time:.2f} 秒")
-            logging.info(f"CPU使用变化: {end_cpu - start_cpu:.2f}%")
-            logging.info(f"内存占用变化: {(end_mem - start_mem) / 1024 / 1024:.2f} MB")
-            
-    def _register_signals(self) -> None:
-        if os.name == 'nt':
-            win32api.SetConsoleCtrlHandler(self._windows_signal_handler, True)
-        else:
-            signal.signal(signal.SIGINT, self._signal_handler)
-            signal.signal(signal.SIGTERM, self._signal_handler)
-
-    def _signal_handler(self, signum: int, frame) -> None:
-        logging.info(f"接收到信号 {signum}，正在关闭调度器...")
-        self.shutdown(signum)
-
-    def _windows_signal_handler(self, dwCtrlType: int) -> bool:
-        if dwCtrlType in (0, 1):  # CTRL_C_EVENT 或 CTRL_BREAK_EVENT
-            logging.info("接收到 Windows 控制信号，正在关闭调度器...")
-            self.shutdown()
-            return True
-        return False
-
-    def shutdown(self, signum: Optional[int] = None) -> None:
-        self.shutdown_flag = True
-        logging.info("正在关闭调度器...")
-        if self.main_handler.current_process and self.main_handler.current_process.poll() is None:
-            try:
-                parent = psutil.Process(self.main_handler.current_process.pid)
-                for child in parent.children(recursive=True):
-                    child.terminate()
-                parent.terminate()
-                parent.wait(timeout=self.PROCESS_TERMINATE_TIMEOUT)
-                logging.info("子进程已正常终止")
-            except psutil.NoSuchProcess:
-                logging.warning("子进程已不存在")
-            except psutil.TimeoutExpired:
-                parent.kill()
-                logging.warning("子进程未在超时时间内终止，已强制杀死")
-        if self.scheduler.running:
-            self.scheduler.shutdown(wait=False)
-            logging.info("调度器已关闭")
-        self.file_manager.observer.stop()
-        self.file_manager.observer.join()
-        logging.info("文件监控已停止")
-        sys.exit(0)
-
-# 去重插件
-class DedupPlugin(TaskPlugin):
-    """去重任务插件。"""
-    def __init__(self, file_manager: FileManager):
-        self.file_manager = file_manager
-
-    def execute(self, context: Dict[str, any]) -> bool:
-        time_range = context['time_range']
-        processed_count = self.file_manager.dedup_videos(time_range)
-        context['processed_count'] = processed_count
-        return processed_count > 0
 
 if __name__ == "__main__":
-    config = AppConfig()
-    file_manager = FileManager(config)
-    flush_handler = FlushHandler(config)
-    main_handler = MainCommandHandler(config)
-    upload_handler = UploadHandler(config)
-    scheduler = SchedulerManager(config, file_manager, flush_handler, main_handler, upload_handler)
-    scheduler.start()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    sys.exit(main())

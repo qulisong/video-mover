@@ -1,5 +1,6 @@
 requests
 playwright
+prompt-toolkit>=3.0.48,<4
 eventlet
 schedule
 cf_clearance

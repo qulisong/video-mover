@@ -1,0 +1,11 @@
+.venv/
+.venv-klein/
+__pycache__/
+*.py[cod]
+logs/
+app.log*
+Download/
+douyin.local.yaml
+*.db
+.browser-profile/
+.models/
